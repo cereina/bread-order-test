@@ -1,5 +1,5 @@
 /*
- * Simple Node.js server for the Bread Order App — with Auth & Railway helpers.
+ * Simple Node.js server for the Bread Order App — with Auth & Railway/iOS fixes.
  * Place this file next to: index.html, styles.css, items.json, orders.json, users.json
  */
 
@@ -9,13 +9,13 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
-const BASE_DIR = __dirname;
+const BASE_DIR = __dirname; // Define before use
 
+// Detect HTTPS behind Railway's proxy
 function isHttps(req) {
   const xf = (req.headers['x-forwarded-proto'] || '').toString().toLowerCase();
   return xf.includes('https');
 }
- // Define before use
 
 // ===== Writable FS helpers for Railway (ephemeral / read-only at times) =====
 let MEMORY_FILES = {}; // path -> stringified JSON (fallback if FS isn't writable)
@@ -49,12 +49,13 @@ const ordersFile = path.join(BASE_DIR, 'orders.json');
 const itemsFile  = path.join(BASE_DIR, 'items.json');
 const usersFile  = path.join(BASE_DIR, 'users.json');
 
-// ===== Basic JSON response helper =====
+// ===== Basic JSON response helper (no-store + HSTS) =====
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Cache-Control': 'no-store',
+    'Cache-Control': 'no-store', // prevents stale auth on iOS/SW
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
@@ -62,7 +63,7 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-// ===== Static file helper =====
+// ===== Static file helper (no-store for HTML) =====
 function serveStatic(filePath, res) {
   const ext = path.extname(filePath).toLowerCase();
   const map = {
@@ -80,12 +81,16 @@ function serveStatic(filePath, res) {
     if (err) {
       res.writeHead(404);
       res.end('Not Found');
-    } else {
-      const headers = { 'Content-Type': map[ext] || 'application/octet-stream' };
-      if (ext === '.html') headers['Cache-Control'] = 'no-store';
-      res.writeHead(200, headers);
-      res.end(data);
+      return;
     }
+    const headers = {
+      'Content-Type': map[ext] || 'application/octet-stream',
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload'
+    };
+    // Make HTML network-fresh (prevents login loops/stale pages on iPhone)
+    if (ext === '.html') headers['Cache-Control'] = 'no-store';
+    res.writeHead(200, headers);
+    res.end(data);
   });
 }
 function redirect(res, location) {
@@ -127,13 +132,14 @@ function parseCookies(req) {
   });
   return cookies;
 }
+// Secure cookie setter (auto-append Secure on HTTPS)
 function setCookie(res, name, value, opts = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`];
   if (opts.httpOnly !== false) parts.push('HttpOnly');
   parts.push(`Path=${opts.path || '/'}`);
   if (opts.maxAge != null) parts.push(`Max-Age=${opts.maxAge}`);
   parts.push(`SameSite=${opts.sameSite || 'Lax'}`);
-  if (opts.secure) parts.push('Secure');
+  if (opts.secure || res.__secureFlag) parts.push('Secure'); // iOS/Safari need this on HTTPS
   res.setHeader('Set-Cookie', parts.join('; '));
 }
 function currentUser(req) {
@@ -178,7 +184,9 @@ if (!fs.existsSync(usersFile)) {
 
 // ===== HTTP server =====
 const server = http.createServer((req, res) => {
+  // Mark whether this request is effectively HTTPS (via proxy)
   res.__secureFlag = isHttps(req);
+
   const method = req.method;
   let url = req.url;
   const q = url.indexOf('?');
